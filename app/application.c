@@ -1,17 +1,22 @@
 #include <application.h>
 
+//#define BATTERY_MINI      // mini module is used
+
 #define SERVICE_INTERVAL_INTERVAL (60 * 60 * 1000)
 #define BATTERY_UPDATE_INTERVAL (60 * 60 * 1000)
 #define SENSOR_PUB_NO_CHANGE_INTEVAL (15 * 60 * 1000)
 #define SENSOR_UPDATE_SERVICE_INTERVAL (5 * 1000)
 #define TEMPERATURE_PUB_VALUE_CHANGE 1.0f
 #define HUMIDITY_PUB_VALUE_CHANGE 5.0f
+#define LUX_PUB_VALUE_CHANGE 5.0f
 #define ACC_UPDATE_INTERVAL (60*1000)        // resend position of node
-#define TOI_STATE_UPDATE_INTERVAL (60*1000)  // resend toi status every 30 sec
+#define ACC_BUMP_INTERVAL 1000               // resend door bump after some time
+#define DOOR_UPDATE_INTERVAL (500)           // check door status 
+#define TOI_STATE_UPDATE_INTERVAL (2*60*1000)  // resend toi status every 30 sec
 #define TOI_GAMEPLAY_INTERVAL (120*1000)     // door still closed but no repeated move event inside 
 #define TOI_MIN_MOVE_TIME (7*1000)           // someone is on toilet when door opened
-#define PIR_PUB_MIN_INTERVAL   0             // 100 msec someone is still under sensor
-#define LED_MESSAGE_FLASH 50                 // short flash when message sent to computer
+#define PIR_NOMOVE_TIME 700                  // have to be closed before move event is triggered
+#define LED_MESSAGE_FLASH 100                // short flash when message sent to computer
 #define TOI_MESSAGE_SUBTOPIC "toi/-/state"   // part of message sent over radio
 #define ACC_MESSAGE_SUBTOPIC "accelerometer/1:19/%s"
 #define GPIO_DOOR BC_GPIO_P10                // door sensor 
@@ -25,7 +30,7 @@ static uint16_t _button_count = 0;
 
 // Thermometer instance
 bc_tmp112_t _tmp112;
-event_param_t temperature_event_param = { .next_pub = 0 };
+event_param_t _temperature_event_param = { .next_pub = 0 };
 
 // PIR motion sensor
 bc_module_pir_t _pir;
@@ -39,10 +44,16 @@ bc_tick_t _sent_time = 0;
 // accelerometer
 bc_lis2dh12_t _acc;
 bc_lis2dh12_alarm_t _acc_alarm;  // alarm settings
+bc_tick_t _bump_time;
 
-// humidity
+// humidity tag
 bc_tag_humidity_t _humidity;
-event_param_t humidity_event_param = { .next_pub = 0 };
+event_param_t _humidity_event_param = { .next_pub = 0 };
+
+// lux meter tag
+bc_opt3001_t _lux;
+event_param_t _lux_event_param = { .next_pub = 0 };
+
 
 // for radio
 //static uint64_t _my_id;
@@ -64,21 +75,24 @@ void application_init(void)
     bc_button_set_event_handler(&_button, button_event_handler, NULL);
 
     // Initialize battery - rem depends on battery module
-    //bc_module_battery_init(BC_MODULE_BATTERY_FORMAT_MINI);
+    #ifdef BATTERY_MINI
+    bc_module_battery_init(BC_MODULE_BATTERY_FORMAT_MINI);
+    #else
     bc_module_battery_init(BC_MODULE_BATTERY_FORMAT_STANDARD);
+    #endif
     bc_module_battery_set_event_handler(battery_event_handler, NULL);
     bc_module_battery_set_update_interval(BATTERY_UPDATE_INTERVAL);
 
     // Initialize thermometer sensor on core module
-    temperature_event_param.channel = BC_RADIO_PUB_CHANNEL_R1_I2C0_ADDRESS_ALTERNATE;
+    _temperature_event_param.channel = BC_RADIO_PUB_CHANNEL_R1_I2C0_ADDRESS_ALTERNATE;
     bc_tmp112_init(&_tmp112, BC_I2C_I2C0, 0x49);
-    bc_tmp112_set_event_handler(&_tmp112, tmp112_event_handler, &temperature_event_param);
+    bc_tmp112_set_event_handler(&_tmp112, tmp112_event_handler, &_temperature_event_param);
     bc_tmp112_set_update_interval(&_tmp112, SENSOR_UPDATE_SERVICE_INTERVAL);
 
     // humidity
-    humidity_event_param.channel = BC_TAG_HUMIDITY_I2C_ADDRESS_DEFAULT;
+    _humidity_event_param.channel = BC_TAG_HUMIDITY_I2C_ADDRESS_DEFAULT;
     bc_tag_humidity_init(&_humidity, BC_TAG_HUMIDITY_REVISION_R2, BC_I2C_I2C0, BC_TAG_HUMIDITY_I2C_ADDRESS_DEFAULT);
-    bc_tag_humidity_set_event_handler(&_humidity, humidity_tag_event_handler, &humidity_event_param);
+    bc_tag_humidity_set_event_handler(&_humidity, humidity_tag_event_handler, &_humidity_event_param);
     bc_tag_humidity_set_update_interval(&_humidity, SENSOR_UPDATE_SERVICE_INTERVAL);
 
     // initialize door sensor
@@ -96,6 +110,12 @@ void application_init(void)
     _acc_alarm.threshold = 1;
     bc_lis2dh12_set_alarm(&_acc, &_acc_alarm);
     bc_lis2dh12_set_event_handler(&_acc, lis2_event_handler, NULL);
+
+    // luxmeter
+    bc_opt3001_init(&_lux, BC_I2C_I2C0, 0x44);
+    bc_opt3001_set_update_interval(&_lux, SENSOR_UPDATE_SERVICE_INTERVAL);
+    // set evend handler (what to do when tag update is triggered)
+    bc_opt3001_set_event_handler(&_lux, lux_module_event_handler, &_lux_event_param);
 
     // to enable backward communication with node
     //bc_radio_listen();
@@ -171,8 +191,8 @@ void application_task()
         send_status();
     }
 
-    // Repeat this task again after 100 ms
-    bc_scheduler_plan_current_relative(100);
+    // Repeat this task again
+    bc_scheduler_plan_current_relative(DOOR_UPDATE_INTERVAL);
 }
 
 
@@ -192,7 +212,8 @@ void pir_event_handler(bc_module_pir_t *self, bc_module_pir_event_t event, void 
             send_status();
 
         bool door = get_door_status();
-        set_occupied(door);
+        if (door && (t-_door_changed_time)>PIR_NOMOVE_TIME)
+            set_occupied(true);
 
         bc_led_pulse(&_led, LED_MESSAGE_FLASH);
     }
@@ -276,12 +297,6 @@ void humidity_tag_event_handler(bc_tag_humidity_t *self, bc_tag_humidity_event_t
     }
 }
 
-void stop_alarm(void* params)
-{
-    (void) params;
-    bc_led_set_mode(&_led, BC_LED_MODE_OFF);
-}
-
 void send_acc_message(const char *event, const char *value)
 {
     char msg[100];
@@ -306,10 +321,14 @@ void lis2_event_handler(bc_lis2dh12_t *self, bc_lis2dh12_event_t event, void *ev
     } 
     else if (event == BC_LIS2DH12_EVENT_ALARM) 
     {
-        bc_led_set_mode(&_led, BC_LED_MODE_BLINK_FAST);
-        bc_scheduler_register(stop_alarm, NULL, bc_tick_get() + 2000);
-        // send message
-        send_acc_message("alarm", "1");
+        bc_tick_t t = bc_tick_get();
+        if (t-_bump_time>ACC_BUMP_INTERVAL)
+        {
+            _bump_time=t;
+            bc_led_pulse(&_led, LED_MESSAGE_FLASH);
+            // send message
+            send_acc_message("alarm", "1");
+        }
     }
     else  if (event == BC_LIS2DH12_EVENT_ERROR)
     {
@@ -317,6 +336,23 @@ void lis2_event_handler(bc_lis2dh12_t *self, bc_lis2dh12_event_t event, void *ev
     }
 }
 
+
+void lux_module_event_handler(bc_opt3001_t *self, bc_opt3001_event_t event, void *event_param) {
+    float illumination = 0.0;
+    event_param_t *param = (event_param_t *)event_param;
+
+    if (event == BC_OPT3001_EVENT_UPDATE) {
+        bc_opt3001_get_illuminance_lux(self, &illumination);
+
+        if ((fabs(illumination - param->value) >= LUX_PUB_VALUE_CHANGE) || (param->next_pub < bc_scheduler_get_spin_tick()))
+        {
+            bc_radio_pub_luminosity(self->_i2c_channel, &illumination);
+            param->value = illumination;
+            param->next_pub = bc_scheduler_get_spin_tick() + SENSOR_PUB_NO_CHANGE_INTEVAL;
+        }
+
+    }
+}
 
 
 /*

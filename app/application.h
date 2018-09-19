@@ -20,6 +20,7 @@ void battery_event_handler(bc_module_battery_event_t event, void *event_param);
 void tmp112_event_handler(bc_tmp112_t *self, bc_tmp112_event_t event, void *event_param);
 void humidity_tag_event_handler(bc_tag_humidity_t *self, bc_tag_humidity_event_t event, void *event_param);
 void lis2_event_handler(bc_lis2dh12_t *self, bc_lis2dh12_event_t event, void *event_param);
+void lux_module_event_handler(bc_opt3001_t *self, bc_opt3001_event_t event, void *event_param);
 
 //static void radio_event_handler(bc_radio_event_t event, void *event_param);
 
